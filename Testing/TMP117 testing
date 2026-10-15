@@ -1,0 +1,47 @@
+#include <Wire.h>
+#include <SparkFun_TMP117.h> 
+
+TMP117 sensor; 
+
+void setup() {
+  // Using a standard, stable baud rate
+  Serial.begin(115200);
+  
+  while(!Serial) {
+    delay(10); 
+  }
+
+  Wire.begin();
+
+  if (sensor.begin() == true) {
+    Serial.println("TMP117 found!");
+  } else {
+    Serial.println("TMP117 not found. Check wiring.");
+    while(1) {
+      delay(10); 
+    }
+  }
+
+  // --- CONFIGURATION FOR MAXIMUM STABILITY ---
+  // 3 = 64x averaging. This is the highest stability mode.
+  // It takes 1 second per reading but provides the most accurate decimal values.
+  sensor.setConversionAverageMode(3); 
+  
+  // Keep it reading continuously
+  sensor.setContinuousConversionMode();
+  
+  Serial.println("Sensor configured for maximum stability (1 reading/sec).");
+}
+
+void loop() {
+  // The dataReady flag will now only trigger about once every second
+  if (sensor.dataReady() == true) {
+    Serial.print("Temperature: ");
+    
+    // Print to 4 decimal places to view the high-resolution, stable data
+    Serial.print(sensor.readTempC(), 4);
+    Serial.println(" °C");
+  }
+  
+  delay(10); 
+}
