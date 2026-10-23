@@ -1,0 +1,112 @@
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
+#include <Adafruit_TMP117.h>
+#include <Wire.h>
+#include <SPI.h>
+
+// TFT Display Pins
+#define TFT_CS    D1
+#define TFT_DC    D2
+#define TFT_RST   D3
+#define TFT_MOSI  D10
+#define TFT_SCLK  D8
+
+// Initialize Display and TMP117
+Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
+Adafruit_TMP117 tmp117;
+
+// Status Flags
+bool tmp_active = false;
+bool mpu_active = false;
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize I2C and SPI pins
+  Wire.begin(D4, D5);
+  SPI.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS); 
+  
+  // Initialize TFT
+  tft.initR(INITR_BLACKTAB); 
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setRotation(1); 
+
+  // Draw Static Labels
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setTextSize(1);
+  tft.setCursor(5, 10);
+  tft.print("TMP117 Temp (C):");
+  tft.setCursor(5, 50);
+  tft.print("MPU Accel (g):");
+
+  // Initialize TMP117
+  if (tmp117.begin()) {
+    tmp_active = true;
+  } else {
+    tft.setCursor(5, 25);
+    tft.setTextColor(ST77XX_RED);
+    tft.print("TMP117 Error!");
+  }
+
+  // Initialize MPU manually via raw I2C commands
+  Wire.beginTransmission(0x68);
+  Wire.write(0x6B); // Access the Power Management Register
+  Wire.write(0x00); // Write 0 to wake up the sensor
+  if (Wire.endTransmission() == 0) {
+    mpu_active = true; // Success
+  } else {
+    tft.setCursor(5, 65);
+    tft.setTextColor(ST77XX_RED);
+    tft.print("MPU I2C Error!");
+  }
+}
+
+void loop() {
+  tft.setTextColor(ST77XX_WHITE);
+
+  // --- Update TMP117 ---
+  if (tmp_active) {
+    sensors_event_t temp;
+    tmp117.getEvent(&temp);
+    
+    tft.fillRect(5, 25, 150, 20, ST77XX_BLACK); 
+    tft.setCursor(5, 25);
+    tft.setTextSize(2);
+    tft.print(temp.temperature, 1);
+  }
+
+  // --- Update MPU manually ---
+  if (mpu_active) {
+    // Point to the first acceleration register (0x3B)
+    Wire.beginTransmission(0x68);
+    Wire.write(0x3B); 
+    Wire.endTransmission(false);
+    
+    // Request 6 bytes (X, Y, and Z data, 2 bytes each)
+    Wire.requestFrom(0x68, 6); 
+
+    if (Wire.available() >= 6) {
+      // Combine the high and low bytes for each axis
+      int16_t ax = (Wire.read() << 8) | Wire.read();
+      int16_t ay = (Wire.read() << 8) | Wire.read();
+      int16_t az = (Wire.read() << 8) | Wire.read();
+
+      // Convert raw 16-bit integers to G-force (default scale is +/- 2g)
+      float x = ax / 16384.0;
+      float y = ay / 16384.0;
+      float z = az / 16384.0;
+
+      // Display the data
+      tft.fillRect(5, 65, 150, 40, ST77XX_BLACK); 
+      tft.setTextSize(1);
+      tft.setCursor(5, 65);
+      tft.print("X: "); tft.print(x, 2);
+      tft.setCursor(5, 80);
+      tft.print("Y: "); tft.print(y, 2);
+      tft.setCursor(5, 95);
+      tft.print("Z: "); tft.print(z, 2);
+    }
+  }
+
+  delay(500);
+}
