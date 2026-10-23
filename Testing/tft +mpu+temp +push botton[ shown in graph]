@@ -1,0 +1,238 @@
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <math.h>
+
+// TFT & Button Pins
+#define TFT_CS    D1
+#define TFT_DC    D2
+#define TFT_RST   D3
+#define TFT_MOSI  D10
+#define TFT_SCLK  D8
+#define BUTTON_PIN D6
+
+Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
+
+// Custom UI Colors (RGB565 Hex)
+#define COLOR_NAVY     0x0113
+#define COLOR_DARKGREY 0x4208
+#define COLOR_GRID     0x2104
+
+bool mpu_active = false;
+unsigned long lastGraphUpdate = 0;
+
+// Timing: 750ms per pixel * 160 pixels = 120,000ms (2 minutes per sweep)
+#define GRAPH_UPDATE_INTERVAL 750 
+
+// Graphing & Data Variables
+int graph_x = 0;
+int prev_graph_y = 125; 
+float all_time_peak = 0.0; // Tracks the absolute highest hit for the text panels
+float interval_peak = 0.0; // Tracks the highest hit within the current 750ms pixel window
+
+// Graph Boundaries
+#define GRAPH_BOTTOM 125
+#define GRAPH_TOP 56
+#define MAX_G_SCALE 5.0 
+
+// Application States
+enum AppState { IDLE, RECORDING, FINISHED };
+AppState currentState = IDLE;
+bool lastButtonState = HIGH;
+
+int calculateRisk(float peak) {
+  int risk = 0;
+  if (peak > 1.5) risk += (peak * 15);
+  if (peak > 3.0) risk += 50; 
+  if (risk > 100) risk = 100;
+  return risk;
+}
+
+void drawGrid() {
+  tft.fillRect(0, 56, 160, 72, ST77XX_BLACK); // Clear graph area
+  
+  // Background Dot Matrix
+  for (int y = GRAPH_BOTTOM; y >= GRAPH_TOP; y -= 14) {
+    for (int x = 0; x < 160; x += 4) tft.drawPixel(x, y, COLOR_GRID);
+  }
+  
+  // Threshold Lines
+  int y_1_5 = GRAPH_BOTTOM - (int)((1.5 / MAX_G_SCALE) * (GRAPH_BOTTOM - GRAPH_TOP));
+  int y_3_0 = GRAPH_BOTTOM - (int)((3.0 / MAX_G_SCALE) * (GRAPH_BOTTOM - GRAPH_TOP));
+  
+  for(int i = 0; i < 160; i+=4) {
+    tft.drawPixel(i, y_1_5, ST77XX_YELLOW);
+    tft.drawPixel(i, y_3_0, ST77XX_RED);
+  }
+}
+
+void drawStatus(const char* text, uint16_t color) {
+  tft.fillRect(125, 0, 35, 16, COLOR_NAVY); // Clear just the status corner
+  tft.setTextColor(color);
+  tft.setTextSize(1);
+  tft.setCursor(130, 4);
+  tft.print(text);
+}
+
+void updateValues(float peak, int risk) {
+  // Erase old numbers securely inside the rounded rectangles
+  tft.fillRect(6, 34, 66, 16, ST77XX_BLACK);
+  tft.fillRect(86, 34, 66, 16, ST77XX_BLACK);
+  
+  tft.setTextSize(2);
+  
+  // Update Peak Shock Panel
+  uint16_t pColor = ST77XX_GREEN;
+  if(peak >= 1.5) pColor = ST77XX_YELLOW;
+  if(peak >= 3.0) pColor = ST77XX_RED;
+  tft.setTextColor(pColor);
+  tft.setCursor(6, 34);
+  tft.print(peak, 1);
+  
+  // Update Risk Panel
+  uint16_t rColor = ST77XX_GREEN;
+  if(risk >= 20) rColor = ST77XX_YELLOW;
+  if(risk >= 60) rColor = ST77XX_RED;
+  tft.setTextColor(rColor);
+  tft.setCursor(86, 34);
+  tft.print(risk); tft.print("%");
+}
+
+void buildUI() {
+  // Top Header
+  tft.fillRect(0, 0, 160, 16, COLOR_NAVY);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setTextSize(1);
+  tft.setCursor(5, 4);
+  tft.print("SMARTCRATE AI");
+  
+  // Data Panels (Rounded Rectangles)
+  tft.drawRoundRect(2, 20, 76, 32, 3, COLOR_DARKGREY);
+  tft.drawRoundRect(82, 20, 76, 32, 3, COLOR_DARKGREY);
+  
+  // Panel Labels
+  tft.setTextColor(0xAD75); // Light Grey
+  tft.setCursor(6, 23); tft.print("PEAK (g)");
+  tft.setCursor(86, 23); tft.print("RISK %");
+
+  drawGrid();
+  updateValues(0.0, 0);
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  
+  Wire.begin(D4, D5);
+  SPI.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS); 
+  
+  tft.initR(INITR_BLACKTAB); 
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setRotation(1); 
+
+  buildUI();
+  drawStatus("RDY", ST77XX_GREEN);
+
+  // Initialize MPU manually
+  Wire.beginTransmission(0x68);
+  Wire.write(0x6B); 
+  Wire.write(0x00); 
+  if (Wire.endTransmission() == 0) {
+    mpu_active = true;
+    Wire.beginTransmission(0x68);
+    Wire.write(0x1C); 
+    Wire.write(0x10); 
+    Wire.endTransmission();
+  }
+}
+
+void loop() {
+  // 1. Button Logic
+  bool currentButtonState = digitalRead(BUTTON_PIN);
+  if (lastButtonState == HIGH && currentButtonState == LOW) {
+    delay(30); 
+    if (digitalRead(BUTTON_PIN) == LOW) {
+      if (currentState == IDLE || currentState == FINISHED) {
+        // Start new 2-minute cycle
+        currentState = RECORDING;
+        graph_x = 0;
+        all_time_peak = 0.0;
+        interval_peak = 0.0;
+        
+        drawGrid();
+        updateValues(0.0, 0);
+        drawStatus("REC", ST77XX_RED);
+        lastGraphUpdate = millis();
+      } else if (currentState == RECORDING) {
+        // Manual stop
+        currentState = FINISHED;
+        drawStatus("END", ST77XX_YELLOW);
+      }
+    }
+  }
+  lastButtonState = currentButtonState;
+
+  // 2. High-Speed Sensor Polling
+  if (mpu_active && currentState == RECORDING) {
+    float current_impact = 0.0;
+
+    Wire.beginTransmission(0x68);
+    Wire.write(0x3B); 
+    Wire.endTransmission(false);
+    Wire.requestFrom(0x68, 6); 
+
+    if (Wire.available() >= 6) {
+      int16_t ax = (Wire.read() << 8) | Wire.read();
+      int16_t ay = (Wire.read() << 8) | Wire.read();
+      int16_t az = (Wire.read() << 8) | Wire.read();
+
+      float x = ax / 4096.0;
+      float y = ay / 4096.0;
+      float z = az / 4096.0;
+
+      float total_g = sqrt((x*x) + (y*y) + (z*z));
+      current_impact = abs(total_g - 1.0); 
+
+      // Track interval peak for the graph
+      if (current_impact > interval_peak) {
+        interval_peak = current_impact;
+      }
+
+      // INSTANT UI UPDATE: If a massive shock hits, update the text panels instantly 
+      // without waiting for the 750ms graph delay.
+      if (current_impact > all_time_peak) {
+        all_time_peak = current_impact;
+        updateValues(all_time_peak, calculateRisk(all_time_peak));
+      }
+    }
+
+    // 3. Render Graph Every 750ms
+    if (millis() - lastGraphUpdate > GRAPH_UPDATE_INTERVAL) {
+      
+      float display_val = interval_peak;
+      if (display_val > MAX_G_SCALE) display_val = MAX_G_SCALE;
+      int graph_y = GRAPH_BOTTOM - (int)((display_val / MAX_G_SCALE) * (GRAPH_BOTTOM - GRAPH_TOP));
+
+      uint16_t lineColor = ST77XX_GREEN;
+      if (interval_peak >= 1.5) lineColor = ST77XX_YELLOW;
+      if (interval_peak >= 3.0) lineColor = ST77XX_RED;
+
+      if (graph_x > 0) {
+        tft.drawLine(graph_x - 1, prev_graph_y, graph_x, graph_y, lineColor);
+        tft.drawLine(graph_x - 1, prev_graph_y - 1, graph_x, graph_y - 1, lineColor);
+      }
+      
+      prev_graph_y = graph_y;
+      graph_x++;
+
+      if (graph_x >= 160) {
+        currentState = FINISHED;
+        drawStatus("END", ST77XX_YELLOW);
+      }
+
+      interval_peak = 0.0;
+      lastGraphUpdate = millis();
+    }
+  }
+}
