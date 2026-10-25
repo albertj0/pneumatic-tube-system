@@ -1,0 +1,105 @@
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
+#include <SPI.h>
+#include <SD.h>
+#include <JPEGDEC.h>
+// Allocate a 25KB buffer in RAM to hold one video frame
+#define MAX_JPEG_SIZE 25000 
+uint8_t jpegBuffer[MAX_JPEG_SIZE];
+// Define Pins
+#define TFT_CS    D1
+#define TFT_DC    D2 
+#define TFT_RST   D3 
+#define SD_CS     D7
+
+// Initialize Adafruit with Hardware SPI
+Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
+
+JPEGDEC jpeg;
+File videoFile;
+
+// Function to draw each decoded video frame
+int JPEGDraw(JPEGDRAW *pDraw) {
+  tft.drawRGBBitmap(pDraw->x, pDraw->y, pDraw->pPixels, pDraw->iWidth, pDraw->iHeight);
+  return 1;
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Keep SD card inactive while setting up the screen
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);
+
+  // Initialize Screen
+  tft.initR(INITR_BLACKTAB); 
+  tft.setRotation(1); // Set to landscape mode
+  tft.fillScreen(ST77XX_BLACK);
+
+  // Initialize SD Card
+  if (!SD.begin(SD_CS)) {
+    Serial.println("SD Card initialization failed!");
+    tft.setCursor(0, 0);
+    tft.setTextColor(ST77XX_RED);
+    tft.print("SD Card Error");
+    return;
+  }
+
+  // Open the video file
+  videoFile = SD.open("/video.mjpeg");
+  if (!videoFile) {
+    Serial.println("Could not find video.mjpeg");
+    tft.setCursor(0, 0);
+    tft.setTextColor(ST77XX_RED);
+    tft.print("File not found");
+    return;
+  }
+}
+
+void loop() {
+  if (!videoFile) return;
+
+  int bufIdx = 0;
+  bool foundStart = false;
+  bool foundEnd = false;
+
+  // Read through the file to extract exactly one JPEG frame
+  while (videoFile.available()) {
+    uint8_t b = videoFile.read();
+    
+    if (!foundStart) {
+      // Look for the "Start of Image" marker (FF D8)
+      if (b == 0xFF && videoFile.peek() == 0xD8) {
+        foundStart = true;
+        jpegBuffer[bufIdx++] = b;
+        jpegBuffer[bufIdx++] = videoFile.read(); // Consume the 0xD8
+      }
+    } else {
+      // Store frame data into the RAM buffer
+      jpegBuffer[bufIdx++] = b;
+      
+      // Look for the "End of Image" marker (FF D9)
+      if (b == 0xFF && videoFile.peek() == 0xD9) {
+        jpegBuffer[bufIdx++] = videoFile.read(); // Consume the 0xD9
+        foundEnd = true;
+        break; // Frame is complete!
+      }
+      
+      // Safety check to prevent crashing if a frame is too large
+      if (bufIdx >= MAX_JPEG_SIZE - 1) {
+        break; 
+      }
+    }
+  }
+
+  if (foundStart && foundEnd) {
+    // Decode and draw the isolated frame directly from RAM
+    if (jpeg.openRAM(jpegBuffer, bufIdx, JPEGDraw)) {
+      jpeg.decode(0, 0, 0);
+      jpeg.close();
+    }
+  } else if (!videoFile.available()) {
+    // We reached the end of the file, loop back to the beginning
+    videoFile.seek(0); 
+  }
+}
