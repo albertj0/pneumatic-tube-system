@@ -1,0 +1,394 @@
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
+#include <Adafruit_TMP117.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+#include <WiFi.h>
+#include <time.h>
+#include <math.h>
+
+// --- USER CONFIGURATION ---
+const char* WIFI_SSID     = "YOUR_WIFI_NAME_HERE";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD_HERE";
+const char* ntpServer     = "pool.ntp.org";
+const long  gmtOffset_sec = 19800; 
+const int   daylightOffset_sec = 0;
+// --------------------------
+
+// Pins
+#define TFT_CS    D1
+#define TFT_DC    D2
+#define TFT_RST   D3
+#define TFT_MOSI  D10
+#define TFT_SCLK  D8
+#define SD_MISO   D9
+#define SD_CS     D7
+#define BUTTON_PIN D6
+#define BATTERY_PIN A0 // D0 pin for analog reading
+
+Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
+Adafruit_TMP117 tmp117;
+
+#define COLOR_NAVY     0x0113
+#define COLOR_DARKGREY 0x4208
+#define COLOR_GRID     0x2104
+
+bool mpu_active = false;
+bool tmp_active = false;
+bool sd_active  = false;
+
+unsigned long lastGraphUpdate = 0;
+unsigned long lastClockUpdate = 0;
+#define GRAPH_UPDATE_INTERVAL 750 
+
+int graph_x = 0;
+int prev_graph_y = 125; 
+float all_time_peak = 0.0; 
+float interval_peak = 0.0; 
+float current_temp = 0.0;
+char currentFileName[20] = "";
+
+#define GRAPH_BOTTOM 125
+#define GRAPH_TOP 56
+#define MAX_G_SCALE 5.0 
+
+enum AppState { IDLE, RECORDING, FINISHED };
+AppState currentState = IDLE;
+bool lastButtonState = HIGH;
+
+int calculateRisk(float peak, float temp) {
+  int risk = 0;
+  if (peak > 1.5) risk += (peak * 15);
+  if (peak > 3.0) risk += 50; 
+  if (temp > 6.0) risk += (temp - 6.0) * 15;
+  if (temp > 0.0 && temp < 2.0) risk += (2.0 - temp) * 20;
+
+  if (risk > 100) risk = 100;
+  if (risk < 0) risk = 0;
+  return risk;
+}
+
+void drawGrid() {
+  tft.fillRect(0, 56, 160, 72, ST77XX_BLACK); 
+  
+  for (int y = GRAPH_BOTTOM; y >= GRAPH_TOP; y -= 14) {
+    for (int x = 0; x < 160; x += 4) tft.drawPixel(x, y, COLOR_GRID);
+  }
+  
+  int y_1_5 = GRAPH_BOTTOM - (int)((1.5 / MAX_G_SCALE) * (GRAPH_BOTTOM - GRAPH_TOP));
+  int y_3_0 = GRAPH_BOTTOM - (int)((3.0 / MAX_G_SCALE) * (GRAPH_BOTTOM - GRAPH_TOP));
+  
+  for(int i = 0; i < 160; i+=4) {
+    tft.drawPixel(i, y_1_5, ST77XX_YELLOW);
+    tft.drawPixel(i, y_3_0, ST77XX_RED);
+  }
+}
+
+void drawStatus(const char* text, uint16_t color) {
+  tft.fillRect(125, 0, 35, 18, COLOR_NAVY); 
+  tft.setTextColor(color);
+  tft.setTextSize(1);
+  tft.setCursor(130, 5);
+  tft.print(text);
+}
+
+void updateValues(float temp, float peak, int risk) {
+  tft.fillRect(4, 34, 46, 16, ST77XX_BLACK);   
+  tft.fillRect(56, 34, 48, 16, ST77XX_BLACK);  
+  tft.fillRect(110, 34, 46, 16, ST77XX_BLACK); 
+  
+  tft.setTextSize(2);
+  
+  uint16_t tColor = (temp >= 2.0 && temp <= 6.0) ? ST77XX_GREEN : ST77XX_RED;
+  tft.setTextColor(tColor);
+  tft.setCursor(4, 34);
+  tft.print(temp, 1);
+  
+  uint16_t pColor = ST77XX_GREEN;
+  if(peak >= 1.5) pColor = ST77XX_YELLOW;
+  if(peak >= 3.0) pColor = ST77XX_RED;
+  tft.setTextColor(pColor);
+  tft.setCursor(56, 34);
+  tft.print(peak, 1);
+  
+  uint16_t rColor = ST77XX_GREEN;
+  if(risk >= 20) rColor = ST77XX_YELLOW;
+  if(risk >= 60) rColor = ST77XX_RED;
+  tft.setTextColor(rColor);
+  tft.setCursor(110, 34);
+  tft.print(risk); 
+}
+
+void updateBatteryDisplay() {
+  // Read the analog value (0-4095)
+  int rawValue = analogRead(BATTERY_PIN);
+  
+  // Calculate voltage: (Raw / 4095) * 3.3V ref * 2 (Divider multiplier)
+  float voltage = (rawValue / 4095.0) * 3.3 * 2.0;
+  
+  // Map 3.2V (Empty) to 4.2V (Full) to a 0-100 percentage
+  int batteryPct = map(voltage * 100, 320, 420, 0, 100);
+  if (batteryPct > 100) batteryPct = 100;
+  if (batteryPct < 0) batteryPct = 0;
+
+  // Draw Battery in the Header
+  tft.fillRect(125, 10, 35, 8, COLOR_NAVY); 
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setTextSize(1);
+  
+  if (batteryPct < 100) tft.setCursor(130, 10);
+  else tft.setCursor(125, 10);
+  
+  tft.print(batteryPct);
+  tft.print("%");
+}
+
+void buildUI() {
+  tft.fillScreen(ST77XX_BLACK);
+  tft.fillRect(0, 0, 160, 18, COLOR_NAVY);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setTextSize(1);
+  tft.setCursor(2, 2);
+  tft.print("SMARTCRATE");
+  
+  tft.drawRoundRect(2, 20, 50, 32, 3, COLOR_DARKGREY);
+  tft.drawRoundRect(54, 20, 52, 32, 3, COLOR_DARKGREY);
+  tft.drawRoundRect(108, 20, 50, 32, 3, COLOR_DARKGREY);
+  
+  tft.setTextColor(0xAD75); 
+  tft.setCursor(12, 23); tft.print("TEMP");
+  tft.setCursor(64, 23); tft.print("PEAK");
+  tft.setCursor(118, 23); tft.print("RISK");
+
+  drawGrid();
+  updateValues(0.0, 0.0, 0);
+  updateBatteryDisplay();
+}
+
+void updateLiveClock() {
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo, 10)) { 
+    static char lastTimeString[20] = "";
+    char displayTime[20];
+    strftime(displayTime, sizeof(displayTime), "%m/%d %H:%M:%S", &timeinfo);
+    
+    if (strcmp(displayTime, lastTimeString) != 0) {
+      strcpy(lastTimeString, displayTime);
+      tft.fillRect(2, 10, 115, 8, COLOR_NAVY); 
+      tft.setTextColor(ST77XX_WHITE);
+      tft.setTextSize(1);
+      tft.setCursor(2, 10);
+      tft.print(displayTime);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  
+  // ESP32S3 ADC config
+  analogReadResolution(12);
+  
+  Wire.begin(D4, D5);
+  SPI.begin(TFT_SCLK, SD_MISO, TFT_MOSI, TFT_CS); 
+  
+  tft.initR(INITR_BLACKTAB); 
+  tft.setRotation(1); 
+  tft.fillScreen(ST77XX_BLACK);
+  
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setCursor(5, 20);
+  tft.print("Connecting Wi-Fi...");
+  
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 15) {
+    delay(500);
+    tft.print(".");
+    retries++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    tft.setCursor(5, 40);
+    tft.print("Wi-Fi Connected!");
+    tft.setCursor(5, 50);
+    tft.print("Syncing Time...");
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    delay(2000); 
+  } else {
+    tft.setCursor(5, 40);
+    tft.setTextColor(ST77XX_RED);
+    tft.print("Wi-Fi Failed.");
+    delay(2000);
+  }
+  
+  buildUI();
+  
+  if (SD.begin(SD_CS)) {
+    sd_active = true;
+  } else {
+    tft.setTextColor(ST77XX_RED);
+    tft.setTextSize(1);
+    tft.setCursor(85, 2);
+    tft.print("NO SD");
+  }
+
+  drawStatus("RDY", ST77XX_GREEN);
+
+  if (tmp117.begin()) {
+    tmp_active = true;
+  }
+
+  Wire.beginTransmission(0x68);
+  Wire.write(0x6B); 
+  Wire.write(0x00); 
+  if (Wire.endTransmission() == 0) {
+    mpu_active = true;
+    Wire.beginTransmission(0x68);
+    Wire.write(0x1C); 
+    Wire.write(0x10); 
+    Wire.endTransmission();
+  }
+}
+
+void loop() {
+  // 0. Updates
+  if (millis() - lastClockUpdate > 1000) {
+    updateLiveClock();
+    updateBatteryDisplay();
+    lastClockUpdate = millis();
+  }
+
+  // 1. Button Logic & New File Creation
+  bool currentButtonState = digitalRead(BUTTON_PIN);
+  if (lastButtonState == HIGH && currentButtonState == LOW) {
+    delay(30); 
+    if (digitalRead(BUTTON_PIN) == LOW) {
+      if (currentState == IDLE || currentState == FINISHED) {
+        currentState = RECORDING;
+        graph_x = 0;
+        all_time_peak = 0.0;
+        interval_peak = 0.0;
+        
+        drawGrid();
+        updateValues(current_temp, 0.0, calculateRisk(0.0, current_temp));
+        drawStatus("REC", ST77XX_RED);
+        
+        if (sd_active) {
+          int logNumber = 1;
+          while (true) {
+            sprintf(currentFileName, "/SESS_%03d.CSV", logNumber);
+            if (!SD.exists(currentFileName)) {
+              break; 
+            }
+            logNumber++;
+          }
+          
+          File dataFile = SD.open(currentFileName, FILE_APPEND);
+          if (dataFile) {
+            dataFile.println("Date,Time,Temp(C),Peak_Impact(g),Risk(%)");
+            dataFile.close();
+          }
+        }
+        
+        lastGraphUpdate = millis();
+      } else if (currentState == RECORDING) {
+        currentState = FINISHED;
+        drawStatus("END", ST77XX_YELLOW);
+      }
+    }
+  }
+  lastButtonState = currentButtonState;
+
+  // 2. High-Speed Sensor Polling
+  if (mpu_active && currentState == RECORDING) {
+    float current_impact = 0.0;
+
+    Wire.beginTransmission(0x68);
+    Wire.write(0x3B); 
+    Wire.endTransmission(false);
+    Wire.requestFrom(0x68, 6); 
+
+    if (Wire.available() >= 6) {
+      int16_t ax = (Wire.read() << 8) | Wire.read();
+      int16_t ay = (Wire.read() << 8) | Wire.read();
+      int16_t az = (Wire.read() << 8) | Wire.read();
+
+      float x = ax / 4096.0;
+      float y = ay / 4096.0;
+      float z = az / 4096.0;
+
+      float total_g = sqrt((x*x) + (y*y) + (z*z));
+      current_impact = abs(total_g - 1.0); 
+
+      if (current_impact > interval_peak) {
+        interval_peak = current_impact;
+      }
+
+      if (current_impact > all_time_peak) {
+        all_time_peak = current_impact;
+        updateValues(current_temp, all_time_peak, calculateRisk(all_time_peak, current_temp));
+      }
+    }
+
+    // 3. Render Graph, Read Temp, & Log to SD Every 750ms
+    if (millis() - lastGraphUpdate > GRAPH_UPDATE_INTERVAL) {
+      
+      if (tmp_active) {
+        sensors_event_t temp_event;
+        tmp117.getEvent(&temp_event);
+        current_temp = temp_event.temperature;
+        
+        int current_risk = calculateRisk(all_time_peak, current_temp);
+        updateValues(current_temp, all_time_peak, current_risk);
+        
+        if (sd_active && currentFileName[0] != '\0') {
+          File dataFile = SD.open(currentFileName, FILE_APPEND);
+          if (dataFile) {
+            struct tm timeinfo;
+            char dateCSV[12] = "YYYY-MM-DD";
+            char timeCSV[12] = "HH:MM:SS";
+            
+            if (getLocalTime(&timeinfo, 10)) {
+              strftime(dateCSV, sizeof(dateCSV), "%Y-%m-%d", &timeinfo);
+              strftime(timeCSV, sizeof(timeCSV), "%H:%M:%S", &timeinfo);
+            }
+
+            dataFile.print(dateCSV); dataFile.print(",");
+            dataFile.print(timeCSV); dataFile.print(",");
+            dataFile.print(current_temp, 1); dataFile.print(",");
+            dataFile.print(interval_peak, 2); dataFile.print(",");
+            dataFile.println(current_risk);
+            dataFile.close();
+          }
+        }
+      }
+
+      float display_val = interval_peak;
+      if (display_val > MAX_G_SCALE) display_val = MAX_G_SCALE;
+      int graph_y = GRAPH_BOTTOM - (int)((display_val / MAX_G_SCALE) * (GRAPH_BOTTOM - GRAPH_TOP));
+
+      uint16_t lineColor = ST77XX_GREEN;
+      if (interval_peak >= 1.5) lineColor = ST77XX_YELLOW;
+      if (interval_peak >= 3.0) lineColor = ST77XX_RED;
+
+      if (graph_x > 0) {
+        tft.drawLine(graph_x - 1, prev_graph_y, graph_x, graph_y, lineColor);
+        tft.drawLine(graph_x - 1, prev_graph_y - 1, graph_x, graph_y - 1, lineColor);
+      }
+      
+      prev_graph_y = graph_y;
+      graph_x++;
+
+      if (graph_x >= 160) {
+        currentState = FINISHED;
+        drawStatus("END", ST77XX_YELLOW);
+      }
+
+      interval_peak = 0.0;
+      lastGraphUpdate = millis();
+    }
+  }
+}
